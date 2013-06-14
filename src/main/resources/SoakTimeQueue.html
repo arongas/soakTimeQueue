@@ -1,0 +1,192 @@
+<html>
+<body>
+<div>
+<p style="font-size:22px" align="justify">Recently I had phased the following problem. On server side, when something triggered different independent areas of code, I had notifications coming from around the code, which were supposed to notify the client side that something has changed. Client side, on it turn would request information back from the server to update the view. The problem was that with one trigger, each area would send its own event to the client that I thus updated the model thus client side would make a lot of requests to the server to get the updated view. </p>
+<p style="font-size:22px" align="justify">Another problem I have faced was as following. Code that needed to execute some heavy algorithm would get notifications/triggers to execute this algorithm based on model changes. The notifications would be awfully a lot but the algorithm would only compute and update one single value of the model and we only cared for the final value of this model. To make this clear consider a model where two integers (let’s say x,y) and the sum (let’s say sum)of these integers exists. The algorithm computes and updates the sum value while different threads modify asynchronously the two integers. We do not care for how sum changes but only for the sum after different multiple changes of the values of the two integers, so we do not wish to compute with every change of x,y the sum, but after a batch change of x,y have the computed sum.</p>
+<p style="font-size:22px" align="justify">The solution I have found for both problems was to put all these notifications to a soak time blocking queue which would hold the notifications for a certain period of time, merge similar notifications to one single notification and after this time period expired release the messages to the thread sending the notification to the client or applying the computation algorithm. So let’s check how this is done.</p>
+<p style="font-size:22px" align="justify">First let’s create the interface of the notifications that will be put in this blocking queue. What these messages need to have from the blocking soak time queue (BSTQ) perspective is only a mean to find common messages based on which the queue will be able to merge these messages to one message. So they need to have a key.</p>
+<div style="border:1px solid white"><pre style='color:#d1d1d1;background:#000000;'>
+<span style='color:#e66170; font-weight:bold; '>package</span><span style='color:#008073; '> gr</span><span style='color:#d2cd86; '>.</span><span style='color:#008073; '>rongasa</span><span style='color:#d2cd86; '>.</span><span style='color:#008073; '>soakQueue</span><span style='color:#d2cd86; '>.</span><span style='color:#008073; '>api</span><span style='color:#b060b0; '>;</span>
+<span style='color:#e66170; font-weight:bold; '>public</span> <span style='color:#e66170; font-weight:bold; '>interface</span> Message <span style='color:#b060b0; '>{</span>
+  <span style='color:#bb7977; font-weight:bold; '>String</span> getKey<span style='color:#d2cd86; '>(</span><span style='color:#d2cd86; '>)</span><span style='color:#b060b0; '>;</span>
+<span style='color:#b060b0; '>}</span>
+</pre></div>
+<p style="font-size:22px" align="justify">Next let’s create the interface of the BSTQ. What actions users of this queue can perform?</p>
+<p style="font-size:22px" align="justify">They can flush the queue, put a message in the queue and also take this message from the queue. Please note that based on the subsequent implementation take method will be made blocking.</p>
+<div style="border:1px solid white"><div><pre style='color:#d1d1d1;background:#000000;'>
+<span style="color:#e66170; font-weight:bold; ">public</span> <span style="color:#e66170; font-weight:bold; ">interface</span> MessageSoakQueue <span style="color:#b060b0; ">{</span>
+  <span style="color:#e66170; font-weight:bold; ">public</span> <span style="color:#bb7977; ">void</span> clear<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+  <span style="color:#e66170; font-weight:bold; ">public</span> <span style="color:#bb7977; ">void</span> put<span style="color:#d2cd86; ">(</span>Message notification<span style="color:#d2cd86; ">)</span> <span style="color:#e66170; font-weight:bold; ">throws</span> <span style="color:#bb7977; font-weight:bold; ">InterruptedException</span><span style="color:#b060b0; ">;</span>
+  <span style="color:#e66170; font-weight:bold; ">public</span> Message take<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span> <span style="color:#e66170; font-weight:bold; ">throws</span> <span style="color:#bb7977; font-weight:bold; ">InterruptedException</span><span style="color:#b060b0; ">;</span>
+<span style="color:#b060b0; ">}</span>
+</pre></div></div>
+<p style="font-size:22px" align="justify">Finally let’s move to the implementation of the BSTQ. </p>
+<p style="font-size:22px" align="justify">MessageSoakQueueImpl will extend HashMap. As hashmap key will take the key of the messages put into the queue and as value will take a container class like the one below:</p>
+<div style="border:1px solid white"><pre style='color:#d1d1d1;background:#000000;'>
+<span style="color:#e66170; font-weight:bold; ">private</span> <span style="color:#e66170; font-weight:bold; ">class</span> ItemContainerComparator <span style="color:#e66170; font-weight:bold; ">implements</span> Comparator&lt;String> <span style="color:#b060b0; ">{</span>
+    <span style="color:#e66170; font-weight:bold; ">private</span> Map<span style="color:#d2cd86; ">&lt;</span><span style="color:#bb7977; font-weight:bold; ">String</span><span style="color:#d2cd86; ">,</span> ItemContainer<span style="color:#d2cd86; ">></span> base<span style="color:#b060b0; ">;</span>
+
+    <span style="color:#e66170; font-weight:bold; ">public</span> ItemContainerComparator<span style="color:#d2cd86; ">(</span>Map<span style="color:#d2cd86; ">&lt;</span><span style="color:#bb7977; font-weight:bold; ">String</span><span style="color:#d2cd86; ">,</span> ItemContainer<span style="color:#d2cd86; ">></span> base<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      <span style="color:#e66170; font-weight:bold; ">this</span><span style="color:#d2cd86; ">.</span>base <span style="color:#d2cd86; ">=</span> base<span style="color:#b060b0; ">;</span>
+    <span style="color:#b060b0; ">}</span>
+
+    <span style="color:#e66170; font-weight:bold; ">public</span> <span style="color:#bb7977; ">int</span> compare<span style="color:#d2cd86; ">(</span><span style="color:#bb7977; font-weight:bold; ">String</span> item1<span style="color:#d2cd86; ">,</span> <span style="color:#bb7977; font-weight:bold; ">String</span> item2<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      <span style="color:#bb7977; ">int</span> comparisonResult <span style="color:#d2cd86; ">=</span> base<span style="color:#d2cd86; ">.</span>get<span style="color:#d2cd86; ">(</span>item1<span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getValidAfter<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>compareTo<span style="color:#d2cd86; ">(</span>base<span style="color:#d2cd86; ">.</span>get<span style="color:#d2cd86; ">(</span>item2<span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getValidAfter<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#e66170; font-weight:bold; ">if</span> <span style="color:#d2cd86; ">(</span>comparisonResult<span style="color:#d2cd86; ">=</span><span style="color:#d2cd86; ">=</span><span style="color:#008c00; ">0</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">{</span>
+        comparisonResult<span style="color:#d2cd86; ">=</span>item1<span style="color:#d2cd86; ">.</span>compareTo<span style="color:#d2cd86; ">(</span>item2<span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#b060b0; ">}</span>
+      <span style="color:#e66170; font-weight:bold; ">return</span> comparisonResult<span style="color:#b060b0; ">;</span>
+    <span style="color:#b060b0; ">}</span>
+  <span style="color:#b060b0; ">}</span>
+</pre></div>
+<p style="font-size:22px" align="justify">The reason why we need this container will become more obvious in what follows. </p>
+<p style="font-size:22px" align="justify">So let’s start explaining the put method of this queue.</p>
+<div style="border:1px solid white"><pre style='color:#d1d1d1;background:#000000;'>
+@Override
+  <span style="color:#e66170; font-weight:bold; ">public</span> void put(Message message) <span style="color:#e66170; font-weight:bold; ">throws</span> InterruptedException <span style="color:#b060b0; ">{</span>
+    <span style="color:#e66170; font-weight:bold; ">synchronized</span> <span style="color:#d2cd86; ">(</span>mapOperationLock<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      info<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Adding message: "</span> <span style="color:#d2cd86; ">+</span> message<span style="color:#d2cd86; ">.</span>toString<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#e66170; font-weight:bold; ">if</span> <span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">(</span><span style="color:#e66170; font-weight:bold; ">this</span><span style="color:#d2cd86; ">.</span>size<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span> <span style="color:#d2cd86; ">></span><span style="color:#d2cd86; ">=</span> capacity<span style="color:#d2cd86; ">)</span> <span style="color:#d2cd86; ">&amp;</span><span style="color:#d2cd86; ">&amp;</span> <span style="color:#d2cd86; ">!</span><span style="color:#e66170; font-weight:bold; ">this</span><span style="color:#d2cd86; ">.</span>containsKey<span style="color:#d2cd86; ">(</span>message<span style="color:#d2cd86; ">.</span>getKey<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+        log<span style="color:#d2cd86; ">.</span>error<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Message overflow. Dumping message:"</span> <span style="color:#d2cd86; ">+</span> message<span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#b060b0; ">}</span> <span style="color:#e66170; font-weight:bold; ">else</span> <span style="color:#b060b0; ">{</span>
+        <span style="color:#bb7977; font-weight:bold; ">String</span> key <span style="color:#d2cd86; ">=</span> message<span style="color:#d2cd86; ">.</span>getKey<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        <span style="color:#bb7977; font-weight:bold; ">Date</span> increasedDate<span style="color:#d2cd86; ">=</span>getIncreasedDate<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        <span style="color:#bb7977; ">int</span> refreshCounter<span style="color:#d2cd86; ">=</span><span style="color:#008c00; ">0</span><span style="color:#b060b0; ">;</span>
+        <span style="color:#e66170; font-weight:bold; ">if</span> <span style="color:#d2cd86; ">(</span><span style="color:#e66170; font-weight:bold; ">super</span><span style="color:#d2cd86; ">.</span>containsKey<span style="color:#d2cd86; ">(</span>key<span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">{</span>
+          info<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Message with key:"</span><span style="color:#d2cd86; ">+</span>key<span style="color:#d2cd86; ">+</span><span style="color:#00c4c4; ">" already queued. Updating message "</span><span style="color:#d2cd86; ">+</span><span style="color:#e66170; font-weight:bold; ">super</span><span style="color:#d2cd86; ">.</span>get<span style="color:#d2cd86; ">(</span>key<span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getMessage<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>toString<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+          <span style="color:#e66170; font-weight:bold; ">if</span> <span style="color:#d2cd86; ">(</span><span style="color:#e66170; font-weight:bold; ">super</span><span style="color:#d2cd86; ">.</span>get<span style="color:#d2cd86; ">(</span>key<span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getRefreshCounter<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">></span><span style="color:#d2cd86; ">=</span><span style="color:#008c00; ">2</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">{</span>
+            increasedDate<span style="color:#d2cd86; ">=</span><span style="color:#e66170; font-weight:bold; ">super</span><span style="color:#d2cd86; ">.</span>get<span style="color:#d2cd86; ">(</span>key<span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getValidAfter<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+          <span style="color:#b060b0; ">}</span>
+          refreshCounter<span style="color:#d2cd86; ">=</span><span style="color:#e66170; font-weight:bold; ">super</span><span style="color:#d2cd86; ">.</span>get<span style="color:#d2cd86; ">(</span>key<span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getRefreshCounter<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        <span style="color:#b060b0; ">}</span>
+        <span style="color:#e66170; font-weight:bold; ">super</span><span style="color:#d2cd86; ">.</span>put<span style="color:#d2cd86; ">(</span>key<span style="color:#d2cd86; ">,</span> <span style="color:#e66170; font-weight:bold; ">new</span> ItemContainer<span style="color:#d2cd86; ">(</span>message<span style="color:#d2cd86; ">,</span> increasedDate<span style="color:#d2cd86; ">,</span>refreshCounter<span style="color:#d2cd86; ">+</span><span style="color:#008c00; ">1</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        shortItems<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        startClock<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Message added"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#b060b0; ">}</span>
+    <span style="color:#b060b0; ">}</span>
+  <span style="color:#b060b0; ">}</span>
+</pre></div>
+<p style="font-size:22px" align="justify">First, we have a lock object. This object is being used to synchronize put and take methods of our implementation so that we do not have concurrency issues when putting and taking objects. </p>
+<p style="font-size:22px" align="justify">First thing to do is check the capacity of the queue to prevent from our queue exceeding a maximum memory size. This is to prevent memory leaks.</p>
+<p style="font-size:22px" align="justify">Next we get the message key and we check if this message key exists or not in our queue. If it does not, we simply create a new ItemContainer object and add this to the queue. This item container has the message as payload and also the increased date field which is when we wish to have this message available for the consumer of the messages.  So increased date field is a Date object of the current time increased with the soak time that we wish to wait for similar messages. refreshCounter is a functionality which keeps how many times we refreshed the object (as refreshing we mean here that new message with same key was put in the queue).</p>
+<p style="font-size:22px" align="justify">Let’s move on to take. Take is a blocked method. So when someone calls this will wait until a new message is available for him.</p>
+<div style="border:1px solid white"><pre style='color:#d1d1d1;background:#000000;'>
+@Override
+  <span style="color:#e66170; font-weight:bold; ">public</span> Message take() <span style="color:#e66170; font-weight:bold; ">throws</span> InterruptedException <span style="color:#b060b0; ">{</span>
+    debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"take() triggered"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+    Message message<span style="color:#b060b0; ">;</span>
+    <span style="color:#e66170; font-weight:bold; ">synchronized</span> <span style="color:#d2cd86; ">(</span>mapOperationLock<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      <span style="color:#e66170; font-weight:bold; ">try</span> <span style="color:#b060b0; ">{</span>
+        <span style="color:#e66170; font-weight:bold; ">while</span> <span style="color:#d2cd86; ">(</span><span style="color:#e66170; font-weight:bold; ">this</span><span style="color:#d2cd86; ">.</span>size<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span> <span style="color:#d2cd86; ">></span><span style="color:#d2cd86; ">=</span> <span style="color:#008c00; ">0</span> <span style="color:#d2cd86; ">&amp;</span><span style="color:#d2cd86; ">&amp;</span> <span style="color:#d2cd86; ">!</span><span style="color:#e66170; font-weight:bold; ">this</span><span style="color:#d2cd86; ">.</span>hasItems<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">{</span>
+          debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"take() going on wait mode."</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+          mapOperationLock<span style="color:#d2cd86; ">.</span>wait<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+          debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"take() awaken"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        <span style="color:#b060b0; ">}</span>
+      <span style="color:#b060b0; ">}</span> <span style="color:#e66170; font-weight:bold; ">catch</span> <span style="color:#d2cd86; ">(</span><span style="color:#bb7977; font-weight:bold; ">InterruptedException</span> ie<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+        mapOperationLock<span style="color:#d2cd86; ">.</span>notify<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        <span style="color:#e66170; font-weight:bold; ">throw</span> ie<span style="color:#b060b0; ">;</span>
+      <span style="color:#b060b0; ">}</span>
+      debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Retrieving item"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      Map<span style="color:#d2cd86; ">.</span>Entry<span style="color:#d2cd86; ">&lt;</span><span style="color:#bb7977; font-weight:bold; ">String</span><span style="color:#d2cd86; ">,</span> ItemContainer<span style="color:#d2cd86; ">></span> entry <span style="color:#d2cd86; ">=</span> sorted_map<span style="color:#d2cd86; ">.</span>entrySet<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>iterator<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>next<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      message <span style="color:#d2cd86; ">=</span> entry<span style="color:#d2cd86; ">.</span>getValue<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getMessage<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#bb7977; font-weight:bold; ">String</span> key <span style="color:#d2cd86; ">=</span> entry<span style="color:#d2cd86; ">.</span>getKey<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      sorted_map<span style="color:#d2cd86; ">.</span>remove<span style="color:#d2cd86; ">(</span>key<span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#e66170; font-weight:bold; ">this</span><span style="color:#d2cd86; ">.</span>remove<span style="color:#d2cd86; ">(</span>key<span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      stopClock<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      mapOperationLock<span style="color:#d2cd86; ">.</span>notify<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+    <span style="color:#b060b0; ">}</span>
+    info<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Retrieving operational state change message: "</span> <span style="color:#d2cd86; ">+</span> message<span style="color:#d2cd86; ">.</span>toString<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+    <span style="color:#e66170; font-weight:bold; ">return</span> message<span style="color:#b060b0; ">;</span>
+  <span style="color:#b060b0; ">}</span>
+</pre></div>
+<p style="font-size:22px" align="justify">So if the queue has no elements (we will see how this is checked), we simply wait (mapOperationLock.wait()) </p>
+<p style="font-size:22px" align="justify">If the queue has elements we get them from a sorted map and return the message. </p>
+<p style="font-size:22px" align="justify">Ouf!! A lot of unknowns here, what is this sorted map? what are these startClock/stopClock? What are these this.size() >= 0 && !this.hasItems()?</p>
+<p style="font-size:22px" align="justify">Let’s get it from the beginning, what do we want? We want to return objects from the hashmap but... only when these are available for the taking, which means after the soak time period ItemContainer.validAfter has passed. But how do we know about this?</p>
+<p style="font-size:22px" align="justify">Let’s keep a second hasmap which keeps the messages shorted</p>
+<div style="border:1px solid white"><pre style='color:#d1d1d1;background:#000000;'>
+<span style="color:#e66170; font-weight:bold; ">private</span> TreeMap&lt;String, ItemContainer> sorted_map<span style="color:#d2cd86; ">;</span>
+ItemContainerComparator comparator = new ItemContainerComparator(this)<span style="color:#d2cd86; ">;</span>
+sorted_map = new TreeMap(comparator)<span style="color:#d2cd86; ">;</span>
+</pre></div>
+<div style="border:1px solid white"><pre style='color:#d1d1d1;background:#000000;'>
+<span style="color:#e66170; font-weight:bold; ">private</span> <span style="color:#e66170; font-weight:bold; ">class</span> ItemContainerComparator <span style="color:#e66170; font-weight:bold; ">implements</span> Comparator&lt;String> <span style="color:#b060b0; ">{</span>
+    <span style="color:#e66170; font-weight:bold; ">private</span> Map<span style="color:#d2cd86; ">&lt;</span><span style="color:#bb7977; font-weight:bold; ">String</span><span style="color:#d2cd86; ">,</span> ItemContainer<span style="color:#d2cd86; ">></span> base<span style="color:#b060b0; ">;</span>
+
+    <span style="color:#e66170; font-weight:bold; ">public</span> ItemContainerComparator<span style="color:#d2cd86; ">(</span>Map<span style="color:#d2cd86; ">&lt;</span><span style="color:#bb7977; font-weight:bold; ">String</span><span style="color:#d2cd86; ">,</span> ItemContainer<span style="color:#d2cd86; ">></span> base<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      <span style="color:#e66170; font-weight:bold; ">this</span><span style="color:#d2cd86; ">.</span>base <span style="color:#d2cd86; ">=</span> base<span style="color:#b060b0; ">;</span>
+    <span style="color:#b060b0; ">}</span>
+
+    <span style="color:#e66170; font-weight:bold; ">public</span> <span style="color:#bb7977; ">int</span> compare<span style="color:#d2cd86; ">(</span><span style="color:#bb7977; font-weight:bold; ">String</span> item1<span style="color:#d2cd86; ">,</span> <span style="color:#bb7977; font-weight:bold; ">String</span> item2<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      <span style="color:#bb7977; ">int</span> comparisonResult <span style="color:#d2cd86; ">=</span> base<span style="color:#d2cd86; ">.</span>get<span style="color:#d2cd86; ">(</span>item1<span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getValidAfter<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>compareTo<span style="color:#d2cd86; ">(</span>base<span style="color:#d2cd86; ">.</span>get<span style="color:#d2cd86; ">(</span>item2<span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getValidAfter<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#e66170; font-weight:bold; ">if</span> <span style="color:#d2cd86; ">(</span>comparisonResult<span style="color:#d2cd86; ">=</span><span style="color:#d2cd86; ">=</span><span style="color:#008c00; ">0</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">{</span>
+        comparisonResult<span style="color:#d2cd86; ">=</span>item1<span style="color:#d2cd86; ">.</span>compareTo<span style="color:#d2cd86; ">(</span>item2<span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#b060b0; ">}</span>
+      <span style="color:#e66170; font-weight:bold; ">return</span> comparisonResult<span style="color:#b060b0; ">;</span>
+    <span style="color:#b060b0; ">}</span>
+  <span style="color:#b060b0; ">}</span>
+</pre></div>
+<p style="font-size:22px" align="justify">Having the messages shorted using the field of when are messages first valid for consumption, makes simple to check if we currently have a valid message inside the queue, which enables us to create method hasItems().</p>
+<div style="border:1px solid white"><pre style='color:#d1d1d1;background:#000000;'>
+<span style="color:#e66170; font-weight:bold; ">private</span> boolean hasItems() <span style="color:#b060b0; ">{</span>
+    <span style="color:#bb7977; ">boolean</span> result<span style="color:#b060b0; ">;</span>
+    <span style="color:#e66170; font-weight:bold; ">if</span> <span style="color:#d2cd86; ">(</span>sorted_map<span style="color:#d2cd86; ">.</span>size<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span> <span style="color:#d2cd86; ">!</span><span style="color:#d2cd86; ">=</span> <span style="color:#008c00; ">0</span><span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      Map<span style="color:#d2cd86; ">.</span>Entry<span style="color:#d2cd86; ">&lt;</span><span style="color:#bb7977; font-weight:bold; ">String</span><span style="color:#d2cd86; ">,</span> ItemContainer<span style="color:#d2cd86; ">></span> entry <span style="color:#d2cd86; ">=</span> sorted_map<span style="color:#d2cd86; ">.</span>entrySet<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>iterator<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>next<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Message: "</span><span style="color:#d2cd86; ">+</span>entry<span style="color:#d2cd86; ">.</span>getValue<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getMessage<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">+</span><span style="color:#00c4c4; ">" valid: "</span><span style="color:#d2cd86; ">+</span>entry<span style="color:#d2cd86; ">.</span>getValue<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getValidAfter<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      result<span style="color:#d2cd86; ">=</span>entry<span style="color:#d2cd86; ">.</span>getValue<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>getValidAfter<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">.</span>compareTo<span style="color:#d2cd86; ">(</span><span style="color:#e66170; font-weight:bold; ">new</span> <span style="color:#bb7977; font-weight:bold; ">Date</span><span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#d2cd86; ">)</span> <span style="color:#d2cd86; ">&lt;</span><span style="color:#d2cd86; ">=</span> <span style="color:#008c00; ">0</span><span style="color:#b060b0; ">;</span>
+    <span style="color:#b060b0; ">}</span> <span style="color:#e66170; font-weight:bold; ">else</span> <span style="color:#b060b0; ">{</span>
+      result<span style="color:#d2cd86; ">=</span><span style="color:#e66170; font-weight:bold; ">false</span><span style="color:#b060b0; ">;</span>
+    <span style="color:#b060b0; ">}</span>
+    <span style="color:#e66170; font-weight:bold; ">return</span> result<span style="color:#b060b0; ">;</span>
+  <span style="color:#b060b0; ">}</span>
+</pre></div>
+<p style="font-size:22px" align="justify">validAfter time of the message is in past, we have a message to return to the consumer of the messages, otherwise we do not. So take method needs to wait. </p>
+<p style="font-size:22px" align="justify">But wait a minute! Wait until when? This is where mapOperationLock.wait() comes to the rescue and same does start/stopClock() methods.</p>
+<div style="border:1px solid white"><pre style='color:#d1d1d1;background:#000000;'>
+<span style="color:#e66170; font-weight:bold; ">private</span> <span style="color:#e66170; font-weight:bold; ">class</span> Clock <span style="color:#e66170; font-weight:bold; ">implements</span> Runnable <span style="color:#b060b0; ">{</span>
+    <span style="color:#e66170; font-weight:bold; ">private</span> <span style="color:#e66170; font-weight:bold; ">final</span> <span style="color:#bb7977; font-weight:bold; ">Object</span> takeLock<span style="color:#b060b0; ">;</span>
+
+    <span style="color:#e66170; font-weight:bold; ">private</span> Clock<span style="color:#d2cd86; ">(</span><span style="color:#bb7977; font-weight:bold; ">Object</span> takeLock<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      <span style="color:#e66170; font-weight:bold; ">this</span><span style="color:#d2cd86; ">.</span>takeLock <span style="color:#d2cd86; ">=</span> takeLock<span style="color:#b060b0; ">;</span>
+    <span style="color:#b060b0; ">}</span>
+
+    <span style="color:#d2cd86; ">@</span>Override
+    <span style="color:#e66170; font-weight:bold; ">public</span> <span style="color:#bb7977; ">void</span> run<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Clock invoked"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#e66170; font-weight:bold; ">synchronized</span> <span style="color:#d2cd86; ">(</span>takeLock<span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">{</span>
+        debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Clock invoked2"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+         takeLock<span style="color:#d2cd86; ">.</span>notifyAll<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#b060b0; ">}</span>
+      debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Clock invoked successfully"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+    <span style="color:#b060b0; ">}</span>
+  <span style="color:#b060b0; ">}</span>
+</pre></div>
+<div style="border:1px solid white"><pre style='color:#d1d1d1;background:#000000;'>
+<span style="color:#e66170; font-weight:bold; ">private</span> void startClock() <span style="color:#b060b0; ">{</span>
+    <span style="color:#e66170; font-weight:bold; ">synchronized</span> <span style="color:#d2cd86; ">(</span>clockLock<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      <span style="color:#e66170; font-weight:bold; ">if</span> <span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">!</span>timerIsRunning<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+        debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Starting clock"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        schedule<span style="color:#d2cd86; ">=</span>scheduler<span style="color:#d2cd86; ">.</span>scheduleWithFixedDelay<span style="color:#d2cd86; ">(</span>clock<span style="color:#d2cd86; ">,</span> validateAfter<span style="color:#d2cd86; ">/</span><span style="color:#008c00; ">2</span><span style="color:#d2cd86; ">,</span> validateAfter<span style="color:#d2cd86; ">/</span><span style="color:#008c00; ">2</span><span style="color:#d2cd86; ">,</span> TimeUnit<span style="color:#d2cd86; ">.</span>SECONDS<span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        timerIsRunning<span style="color:#d2cd86; ">=</span><span style="color:#e66170; font-weight:bold; ">true</span><span style="color:#b060b0; ">;</span>
+        debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Clock started"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#b060b0; ">}</span>
+    <span style="color:#b060b0; ">}</span>
+  <span style="color:#b060b0; ">}</span>
+
+  <span style="color:#e66170; font-weight:bold; ">private</span> void stopClock() <span style="color:#b060b0; ">{</span>
+    <span style="color:#e66170; font-weight:bold; ">synchronized</span> <span style="color:#d2cd86; ">(</span>clockLock<span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+      <span style="color:#e66170; font-weight:bold; ">if</span> <span style="color:#d2cd86; ">(</span>timerIsRunning <span style="color:#d2cd86; ">&amp;</span><span style="color:#d2cd86; ">&amp;</span> <span style="color:#e66170; font-weight:bold; ">this</span><span style="color:#d2cd86; ">.</span>size<span style="color:#d2cd86; ">(</span><span style="color:#d2cd86; ">)</span> <span style="color:#d2cd86; ">=</span><span style="color:#d2cd86; ">=</span> <span style="color:#008c00; ">0</span><span style="color:#d2cd86; ">)</span> <span style="color:#b060b0; ">{</span>
+        debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Stopping clock"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        schedule<span style="color:#d2cd86; ">.</span>cancel<span style="color:#d2cd86; ">(</span><span style="color:#e66170; font-weight:bold; ">false</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+        timerIsRunning<span style="color:#d2cd86; ">=</span><span style="color:#e66170; font-weight:bold; ">false</span><span style="color:#b060b0; ">;</span>
+        debug<span style="color:#d2cd86; ">(</span><span style="color:#00c4c4; ">"Clock stopped"</span><span style="color:#d2cd86; ">)</span><span style="color:#b060b0; ">;</span>
+      <span style="color:#b060b0; ">}</span>
+    <span style="color:#b060b0; ">}</span>
+  <span style="color:#b060b0; ">}</span>
+</pre></div>
+<p style="font-size:22px" align="justify">We simply have a clock running every soak time period, awakening the take method (if it has been triggered, to check if an item is ready to be consumed).  We simply stop the clock when we are not going to need it and start it when we put new elements to the queue. </p>
+<p style="font-size:22px" align="justify">This is pretty much it. I hope my solution works for your case.</p>
+</div>
+</body>
+</html>
